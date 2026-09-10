@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: unit tests (no DB)
+        run: pytest tests/test_ids.py -q
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: adc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/adc
+      ARTIFACT_STORAGE_BACKEND: local
+      ARTIFACT_LOCAL_ROOT: ${{ github.workspace }}/storage
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: apply migrations
+        run: python scripts/migrate.py
+
+      - name: migrations are idempotent
+        run: python scripts/migrate.py --check
+
+      - name: full test suite
+        run: pytest -q
+
+      - name: data-layer smoke (steps 1-9,三次写入验幂等)
+        run: python scripts/smoke_data_layer.py
+
+      - name: end-to-end (submit -> relay -> worker -> 8 steps)
+        run: python scripts/e2e_check.py
+
+  image:
+    needs: [unit, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t adc-pipeline:${{ github.sha }} .
+      - name: image smoke — app imports inside the image
+        run: docker run --rm adc-pipeline:${{ github.sha }} python -c "import app.api.main; print('image ok')"

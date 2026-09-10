@@ -1,0 +1,80 @@
+# 本地一键起全栈：docker compose up
+#
+# 服务拓扑对应 docs/05 的分层：
+#   db      -> Postgres（AWS 上是 RDS）
+#   migrate -> 一次性任务，跑完退出（AWS 上是 ECS one-off task）
+#   api     -> FastAPI（AWS 上是 ECS service + ALB）
+#   relay   -> outbox -> job_queue（AWS 上 QUEUE_BACKEND=sqs 后可去掉）
+#   worker  -> job_queue -> step_records（AWS 上是 ECS service，按队列深度伸缩）
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/adc
+  ARTIFACT_STORAGE_BACKEND: local
+  ARTIFACT_LOCAL_ROOT: /data/storage
+  QUEUE_BACKEND: local
+  # 本地默认值；任何联网环境必须换成真密钥
+  AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-local-dev-secret-change-me}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: adc
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "54322:5432"          # 宿主机可直连，方便 psql 排查
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d adc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    environment: *app-env
+    command: ["python", "scripts/migrate.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"             # 一次性任务，跑完就退出
+
+  api:
+    build: .
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    volumes:
+      - artifacts:/data/storage
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  relay:
+    build: .
+    environment: *app-env
+    command: ["python", "-m", "app.workers.outbox_relay"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    environment: *app-env
+    command: ["python", "-m", "app.workers.worker"]
+    volumes:
+      - artifacts:/data/storage    # 和 api 共享，预签名 URL 才指得到同一份字节
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  artifacts:
