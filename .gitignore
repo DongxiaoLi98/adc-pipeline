@@ -14,3 +14,9 @@ __pycache__/
 storage/
 minio-data/
 localstack-data/
+
+# terraform
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

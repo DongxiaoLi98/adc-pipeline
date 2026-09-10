@@ -1,0 +1,105 @@
+name: Deploy
+
+# 手动触发。自动部署应等有了 staging 环境再开。
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 目标环境
+        type: choice
+        options: [dev]
+        default: dev
+
+permissions:
+  id-token: write   # OIDC 换取临时凭据，不存长期 access key
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: adc-pipeline
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # 每个 family 注册一个指向新镜像的修订版。
+      # 直接 force-new-deployment 是不够的 —— 那只会重拉任务定义里写死的旧 tag。
+      - name: register task definition revisions
+        run: |
+          set -euo pipefail
+          PREFIX="adc-pipeline-${{ inputs.env }}"
+          for family in api worker migrate; do
+            aws ecs describe-task-definition --task-definition "$PREFIX-$family" \
+              --query taskDefinition > /tmp/$family.json
+            jq --arg img "$IMAGE" '
+              .containerDefinitions |= map(.image = $img)
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy)
+            ' /tmp/$family.json > /tmp/$family.new.json
+            REV=$(aws ecs register-task-definition \
+              --cli-input-json file:///tmp/$family.new.json \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            echo "$family -> $REV"
+            echo "TD_$family=$REV" >> "$GITHUB_ENV"
+          done
+
+      # 迁移必须在服务更新之前完成 —— 新代码可能依赖新 schema
+      - name: run migrations (one-off task)
+        run: |
+          set -euo pipefail
+          PREFIX="adc-pipeline-${{ inputs.env }}"
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=$PREFIX-public-*" \
+            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+          SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$PREFIX-task" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          TASK=$(aws ecs run-task --cluster "$PREFIX" \
+            --task-definition "$TD_migrate" --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "migrate task: $TASK"
+          aws ecs wait tasks-stopped --cluster "$PREFIX" --tasks "$TASK"
+          CODE=$(aws ecs describe-tasks --cluster "$PREFIX" --tasks "$TASK" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          echo "migrate exit code: $CODE"
+          test "$CODE" = "0"
+
+      - name: rolling deploy
+        run: |
+          set -euo pipefail
+          PREFIX="adc-pipeline-${{ inputs.env }}"
+          aws ecs update-service --cluster "$PREFIX" --service "$PREFIX-api" \
+            --task-definition "$TD_api" >/dev/null
+          aws ecs update-service --cluster "$PREFIX" --service "$PREFIX-worker" \
+            --task-definition "$TD_worker" >/dev/null
+          aws ecs wait services-stable --cluster "$PREFIX" \
+            --services "$PREFIX-api" "$PREFIX-worker"
+
+      - name: smoke
+        run: |
+          set -euo pipefail
+          URL=$(aws elbv2 describe-load-balancers --names "adc-pipeline-${{ inputs.env }}" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          curl -fsS "http://$URL/healthz"; echo
+          curl -fsS "http://$URL/readyz"; echo
